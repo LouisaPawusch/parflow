@@ -37,6 +37,14 @@ double ponding_smoothing_width = 0.0;
  * (Solver.Nonlinear.PondingStepLimiter.Offset) */
 static double ponding_step_limiter_offset = 1.0e-5;
 
+/* Which crossings of p = 0 the ponding step limiter stops (Solver.Nonlinear.PondingStepLimiter.Direction):
+ * Both (default, the limiter as before), Wetting (dry -> ponded only) or Drying (ponded -> dry only). The
+ * values are the indices of the names in the key's name array. */
+#define PONDING_STEP_LIMITER_BOTH    0
+#define PONDING_STEP_LIMITER_WETTING 1
+#define PONDING_STEP_LIMITER_DRYING  2
+static int ponding_step_limiter_direction = PONDING_STEP_LIMITER_BOTH;
+
 /*--------------------------------------------------------------------------
  * Structures
  *--------------------------------------------------------------------------*/
@@ -222,12 +230,15 @@ static int PondingStepLimiter(N_Vector current_pressure, N_Vector step, void *cu
         double pressure_now = pressure_data[index];
         double pressure_after_step = pressure_now + step_data[index];
 
-        if (pressure_now < 0.0 && pressure_after_step > 0.0)
+        /* A crossing in the direction not limited is left to Newton (the unlimited step) */
+        if (pressure_now < 0.0 && pressure_after_step > 0.0
+            && ponding_step_limiter_direction != PONDING_STEP_LIMITER_DRYING)
         {
           step_data[index] = ponding_step_limiter_offset - pressure_now;
           nr_limited_cells++;
         }
-        else if (pressure_now > 0.0 && pressure_after_step < 0.0)
+        else if (pressure_now > 0.0 && pressure_after_step < 0.0
+                 && ponding_step_limiter_direction != PONDING_STEP_LIMITER_WETTING)
         {
           step_data[index] = -ponding_step_limiter_offset - pressure_now;
           nr_limited_cells++;
@@ -742,6 +753,11 @@ PFModule  *KinsolNonlinSolverNewPublicXtra()
   NA_FreeNameArray(switch_na);
   sprintf(key, "Solver.Nonlinear.PondingStepLimiter.Offset");
   ponding_step_limiter_offset = GetDoubleDefault(key, 1.0e-5);
+  switch_na = NA_NewNameArray("Both Wetting Drying");
+  sprintf(key, "Solver.Nonlinear.PondingStepLimiter.Direction");
+  switch_name = GetStringDefault(key, "Both");
+  ponding_step_limiter_direction = NA_NameToIndexExitOnError(switch_na, switch_name, key);
+  NA_FreeNameArray(switch_na);
 
   globalization_switch_na = NA_NewNameArray("InexactNewton LineSearch");
   sprintf(key, "Solver.Nonlinear.Globalization");
