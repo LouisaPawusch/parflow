@@ -226,6 +226,7 @@ typedef struct {
   char *nc_evap_trans_filename; /* NetCDF File name for evap trans */
   char *initial_guess_filename; /* prefix of the PFBs that replace the Newton initial guess of each substep ("" = off) */
   double initial_guess_interval; /* length of one substep, in TimingInfo units; guess file k ends at StartTime + k * interval */
+  int initial_guess_predictor_after; /* 1: the surface predictor runs on the guess file; 0: the guess file replaces the predictor's guess */
 } PublicXtra;
 
 typedef struct {
@@ -3062,8 +3063,67 @@ AdvanceRichards(PFModule * this_module, double start_time,      /* Starting time
 
       t += dt;
 
+      /* Oracle / harness: replace the Newton initial guess with a pressure field read from a PFB.
+       * Read before the surface predictor. Solver.InitialGuessFile.SurfacePredictorAfter decides what
+       * the predictor does on a step that read a file:
+       *   False (default): it is skipped, so the file is the whole guess (as when the file was read
+       *     after the predictor: the predictor writes only pressure cells, and the file overwrites them all);
+       *   True: it runs on the file's field, as production's predictor runs on persistence
+       *     (a top cell the file leaves unsaturated is set to PressureValue when the water budget overflows).
+       * Steps that read no file (retries, steps off the substep grid) get the predictor as usual.
+       * old_pressure (the previous step's state) is untouched: only the starting point of the
+       * solve changes, never the problem being solved.
+       * One file per regular substep: the solve from StartTime + (k-1) * interval to
+       * StartTime + k * interval reads <InitialGuessFile>.<k, 5 digits>.pfb.
+       * Only on the first attempt of that solve: if it fails and dt is cut, the retries and the
+       * shorter steps after them (no longer on the substep grid) start from the usual guess.
+       * Rank 0 logs every step either way, so the run log shows where a guess was used. */
+      int initial_guess_read_this_step = 0;
+      if (public_xtra->initial_guess_filename[0] != '\0' && conv_failures == 0)
+      {
+        double step_start_time = t - dt;
+        double substeps_at_end = (t - ProblemStartTime(problem)) / public_xtra->initial_guess_interval;
+        int substep_number = (int)floor(substeps_at_end + 0.5);
+        double substep_start_time = ProblemStartTime(problem) + (substep_number - 1) * public_xtra->initial_guess_interval;
+        double substep_end_time = ProblemStartTime(problem) + substep_number * public_xtra->initial_guess_interval;
+        int is_regular_substep = (substep_number >= 1)
+                                 && (fabs(t - substep_end_time) < TIME_EPSILON)
+                                 && (fabs(step_start_time - substep_start_time) < TIME_EPSILON);
+
+        if (is_regular_substep)
+        {
+          char guess_filename[2048];
+          sprintf(guess_filename, "%s.%05d.pfb", public_xtra->initial_guess_filename, substep_number);
+          ReadPFBinary(guess_filename, instance_xtra->pressure);
+
+          /* ReadPFBinary fills each rank's own cells; exchange so the ghost layers match */
+          handle = InitVectorUpdate(instance_xtra->pressure, VectorUpdateAll);
+          FinalizeVectorUpdate(handle);
+          initial_guess_read_this_step = 1;
+
+          if (!amps_Rank(amps_CommWorld))
+          {
+            amps_Printf("Solver.InitialGuessFile: substep %d (t = %.6f to %.6f): initial guess read from %s%s\n",
+                        substep_number, step_start_time, t, guess_filename,
+                        public_xtra->surface_predictor != 1 ? "" :
+                        (public_xtra->initial_guess_predictor_after ? ", surface predictor applied after it" : ", surface predictor skipped"));
+          }
+        }
+        else if (!amps_Rank(amps_CommWorld))
+        {
+          amps_Printf("Solver.InitialGuessFile: step t = %.6f to %.6f is not a regular substep: usual guess\n",
+                      step_start_time, t);
+        }
+      }
+      else if (public_xtra->initial_guess_filename[0] != '\0' && !amps_Rank(amps_CommWorld))
+      {
+        amps_Printf("Solver.InitialGuessFile: retry after a failed solve, t = %.6f to %.6f: usual guess\n",
+                    t - dt, t);
+      }
+
       /*  experiment with a predictor to adjust land surface pressures to be >0 if rainfall*/
-      if (public_xtra->surface_predictor == 1)
+      if (public_xtra->surface_predictor == 1
+          && (!initial_guess_read_this_step || public_xtra->initial_guess_predictor_after))
       {
         GrGeomSolid *gr_domain = ProblemDataGrDomain(problem_data);
 
@@ -3161,54 +3221,6 @@ AdvanceRichards(PFModule * this_module, double start_time,      /* Starting time
           }
                        );
         }
-      }
-
-      /* Oracle / harness: replace the Newton initial guess with a pressure field read from a PFB.
-       * Placed after the surface predictor, so the file has the last word.
-       * old_pressure (the previous step's state) is untouched: only the starting point of the
-       * solve changes, never the problem being solved.
-       * One file per regular substep: the solve from StartTime + (k-1) * interval to
-       * StartTime + k * interval reads <InitialGuessFile>.<k, 5 digits>.pfb.
-       * Only on the first attempt of that solve: if it fails and dt is cut, the retries and the
-       * shorter steps after them (no longer on the substep grid) start from the usual guess.
-       * Rank 0 logs every step either way, so the run log shows where a guess was used. */
-      if (public_xtra->initial_guess_filename[0] != '\0' && conv_failures == 0)
-      {
-        double step_start_time = t - dt;
-        double substeps_at_end = (t - ProblemStartTime(problem)) / public_xtra->initial_guess_interval;
-        int substep_number = (int)floor(substeps_at_end + 0.5);
-        double substep_start_time = ProblemStartTime(problem) + (substep_number - 1) * public_xtra->initial_guess_interval;
-        double substep_end_time = ProblemStartTime(problem) + substep_number * public_xtra->initial_guess_interval;
-        int is_regular_substep = (substep_number >= 1)
-                                 && (fabs(t - substep_end_time) < TIME_EPSILON)
-                                 && (fabs(step_start_time - substep_start_time) < TIME_EPSILON);
-
-        if (is_regular_substep)
-        {
-          char guess_filename[2048];
-          sprintf(guess_filename, "%s.%05d.pfb", public_xtra->initial_guess_filename, substep_number);
-          ReadPFBinary(guess_filename, instance_xtra->pressure);
-
-          /* ReadPFBinary fills each rank's own cells; exchange so the ghost layers match */
-          handle = InitVectorUpdate(instance_xtra->pressure, VectorUpdateAll);
-          FinalizeVectorUpdate(handle);
-
-          if (!amps_Rank(amps_CommWorld))
-          {
-            amps_Printf("Solver.InitialGuessFile: substep %d (t = %.6f to %.6f): initial guess read from %s\n",
-                        substep_number, step_start_time, t, guess_filename);
-          }
-        }
-        else if (!amps_Rank(amps_CommWorld))
-        {
-          amps_Printf("Solver.InitialGuessFile: step t = %.6f to %.6f is not a regular substep: usual guess\n",
-                      step_start_time, t);
-        }
-      }
-      else if (public_xtra->initial_guess_filename[0] != '\0' && !amps_Rank(amps_CommWorld))
-      {
-        amps_Printf("Solver.InitialGuessFile: retry after a failed solve, t = %.6f to %.6f: usual guess\n",
-                    t - dt, t);
       }
 
       /*******************************************************************/
@@ -6460,6 +6472,10 @@ SolverRichardsNewPublicXtra(char *name)
   public_xtra->initial_guess_filename = GetStringDefault(key, "");
   sprintf(key, "%s.InitialGuessFile.Interval", name);
   public_xtra->initial_guess_interval = GetDoubleDefault(key, 1.0);
+  sprintf(key, "%s.InitialGuessFile.SurfacePredictorAfter", name);
+  switch_name = GetStringDefault(key, "False");
+  switch_value = NA_NameToIndexExitOnError(switch_na, switch_name, key);
+  public_xtra->initial_guess_predictor_after = switch_value;
 
   NA_FreeNameArray(switch_na);
   PFModulePublicXtra(this_module) = public_xtra;
