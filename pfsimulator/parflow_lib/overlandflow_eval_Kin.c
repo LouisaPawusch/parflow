@@ -93,6 +93,8 @@ void    OverlandFlowEvalKin(
 
   int i, j, k, ival = 0, sy_v;
 
+  int first_x, last_x, first_y, last_y;
+
   PF_UNUSED(ival);
 
   p_sub = VectorSubvector(pressure, sg);
@@ -113,6 +115,18 @@ void    OverlandFlowEvalKin(
 
   sy_v = SubvectorNX(top_sub);
 
+  /* The loops below visit the subgrid plus one ghost cell on each side, which is exactly the
+   * extent of the 2D subvectors (top, patch, slopes, mannings and the flux arrays). On that
+   * outermost ring a neighbour at i-1, i+1, j-1 or j+1 lies outside the subvectors. Reading it
+   * reads past the array ends, and the patch-edge and lower-boundary fixes then index pp and
+   * write the flux arrays out of bounds (random segfaults on Vista, silent memory corruption
+   * otherwise). Such a neighbour is treated as missing (top -1, patch -1), and the fluxes of
+   * faces outside the subvectors, which this rank never uses, are not computed. */
+  first_x = SubvectorIX(top_sub);
+  last_x = SubvectorIX(top_sub) + SubvectorNX(top_sub) - 1;
+  first_y = SubvectorIY(top_sub);
+  last_y = SubvectorIY(top_sub) + SubvectorNY(top_sub) - 1;
+
   //ov_epsilon= 1.0e-5;
   ov_epsilon = GetDoubleDefault("Solver.OverlandKinematic.Epsilon", 1.0e-5);
 
@@ -127,7 +141,8 @@ void    OverlandFlowEvalKin(
                                          int p1, p0x, p0y;
                                          double Sf_x, Sf_y, Sf_mag;
                                          double Press_x, Press_y; 
-                                         double PP_ipp1, PP_ippsy, PP_ip;),
+                                         double PP_ipp1, PP_ippsy, PP_ip;
+                                         int has_west, has_east, has_south, has_north;),
                                   CellSetup(DoNothing),
                                   FACE(LeftFace, DoNothing), FACE(RightFace, DoNothing),
                                   FACE(DownFace, DoNothing), FACE(UpFace, DoNothing),
@@ -138,15 +153,21 @@ void    OverlandFlowEvalKin(
       itop = SubvectorEltIndex(top_sub, i, j, 0);
       ipat = SubvectorEltIndex(patch_sub, i, j, 0);
 
+      // neighbours outside the subvectors (outermost ghost ring) count as missing, see above
+      has_west = (i > first_x);
+      has_east = (i < last_x);
+      has_south = (j > first_y);
+      has_north = (j < last_y);
+
       k1 = (int)top_dat[itop];
-      k0x = (int)top_dat[itop - 1];
-      k0y = (int)top_dat[itop - sy_v];
-      k1x = (int)top_dat[itop + 1];
-      k1y = (int)top_dat[itop + sy_v];
+      k0x = has_west ? (int)top_dat[itop - 1] : -1;
+      k0y = has_south ? (int)top_dat[itop - sy_v] : -1;
+      k1x = has_east ? (int)top_dat[itop + 1] : -1;
+      k1y = has_north ? (int)top_dat[itop + sy_v] : -1;
       //RMM added patches to check for internal bc edges
       p1 = (int)patch_dat[ipat];
-      p0x = (int)patch_dat[ipat - 1];
-      p0y = (int)patch_dat[ipat - sy_v];
+      p0x = has_west ? (int)patch_dat[ipat - 1] : -1;
+      p0y = has_south ? (int)patch_dat[ipat - sy_v] : -1;
       //printf("Current Patch %d, lower x %d, lower y %d, (%d,%d,%d)\n",p1, p0x, p0y, i,j,k);
       //printf("Current top %d, lower x %d, lower y %d, (%d,%d,%d)\n",k1, k0x, k0y, i,j,k);
 
@@ -226,8 +247,8 @@ void    OverlandFlowEvalKin(
         }
       }
 
-      //fix for lower x boundary
-      if (k0x < 0.0)
+      //fix for lower x boundary (not on the outermost ghost column, its face io - 1 is outside)
+      if (has_west && k0x < 0.0)
       {
         if (k1 >= 0.0)
         {
@@ -247,8 +268,8 @@ void    OverlandFlowEvalKin(
         }
       }
 
-      //fix for lower y boundary
-      if (k0y < 0.0)
+      //fix for lower y boundary (not on the outermost ghost row, its face io - sy_v is outside)
+      if (has_south && k0y < 0.0)
       {
         if (k1 >= 0.0)
         {
@@ -302,7 +323,8 @@ void    OverlandFlowEvalKin(
                                          int p1, p0x, p0y;
                                          double Sf_x, Sf_y, Sf_mag;
                                          double Press_x, Press_y, qx_temp, qy_temp;
-                                         double PP_ipp1, PP_ippsy; ),
+                                         double PP_ipp1, PP_ippsy;
+                                         int has_west, has_east, has_south, has_north; ),
                                   CellSetup(DoNothing),
                                   FACE(LeftFace, DoNothing), FACE(RightFace, DoNothing),
                                   FACE(DownFace, DoNothing), FACE(UpFace, DoNothing),
@@ -313,15 +335,21 @@ void    OverlandFlowEvalKin(
       itop = SubvectorEltIndex(top_sub, i, j, 0);
       ipat = SubvectorEltIndex(patch_sub, i, j, 0);
 
+      // neighbours outside the subvectors (outermost ghost ring) count as missing, see above
+      has_west = (i > first_x);
+      has_east = (i < last_x);
+      has_south = (j > first_y);
+      has_north = (j < last_y);
+
       k1 = (int)top_dat[itop];
-      k0x = (int)top_dat[itop - 1];
-      k0y = (int)top_dat[itop - sy_v];
-      k1x = (int)top_dat[itop + 1];
-      k1y = (int)top_dat[itop + sy_v];
+      k0x = has_west ? (int)top_dat[itop - 1] : -1;
+      k0y = has_south ? (int)top_dat[itop - sy_v] : -1;
+      k1x = has_east ? (int)top_dat[itop + 1] : -1;
+      k1y = has_north ? (int)top_dat[itop + sy_v] : -1;
       //RMM added patches to check for internal bc edges
       p1 = (int)patch_dat[ipat];
-      p0x = (int)patch_dat[ipat - 1];
-      p0y = (int)patch_dat[ipat - sy_v];
+      p0x = has_west ? (int)patch_dat[ipat - 1] : -1;
+      p0y = has_south ? (int)patch_dat[ipat - sy_v] : -1;
 
       if (k1 >= 0)
       {
@@ -363,9 +391,12 @@ void    OverlandFlowEvalKin(
         //ks_v[io] = qy_v[io - sy_v];
 
         ke_v[io] = pfmax(qx_temp, 0);
-        kw_v[io + 1] = -pfmax(-qx_temp, 0);
+        // the east (north) neighbour's entry exists only inside the subvector
+        if (has_east)
+          kw_v[io + 1] = -pfmax(-qx_temp, 0);
         kn_v[io] = pfmax(qy_temp, 0);
-        ks_v[io + sy_v] = -pfmax(-qy_temp, 0);
+        if (has_north)
+          ks_v[io + sy_v] = -pfmax(-qy_temp, 0);
       }
 
 // fix for internal patch edges in x direction
@@ -416,8 +447,8 @@ void    OverlandFlowEvalKin(
         }
       }
 
-      //fix for lower x boundary
-      if (k0x < 0.0)
+      //fix for lower x boundary (not on the outermost ghost column, its face io - 1 is outside)
+      if (has_west && k0x < 0.0)
       {
         if (k1 >= 0.0)
         {
@@ -443,8 +474,8 @@ void    OverlandFlowEvalKin(
         }
       }
 
-      //fix for lower y boundary
-      if (k0y < 0.0)
+      //fix for lower y boundary (not on the outermost ghost row, its face io - sy_v is outside)
+      if (has_south && k0y < 0.0)
       {
         if (k1 >= 0.0)
         {
