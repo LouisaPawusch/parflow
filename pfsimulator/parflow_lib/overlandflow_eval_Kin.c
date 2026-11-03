@@ -190,11 +190,11 @@ void    OverlandFlowEvalKin(
         if (k1y >= 0)
           PP_ippsy = pp[ippsy];
         Press_x = RPMean(-Sf_x, 0.0,
-                         pfmax((PP_ip), 0.0),
-                         pfmax((PP_ipp1), 0.0));
+                         PondedDepth(PP_ip),
+                         (k1x >= 0) ? PondedDepth(PP_ipp1) : 0.0);
         Press_y = RPMean(-Sf_y, 0.0,
-                         pfmax((PP_ip), 0.0),
-                         pfmax((PP_ippsy), 0.0));
+                         PondedDepth(PP_ip),
+                         (k1y >= 0) ? PondedDepth(PP_ippsy) : 0.0);
 
         qx_v[io] = -(Sf_x / (RPowerR(fabs(Sf_mag), 0.5) * mann_dat[io]))
                    * RPowerR(Press_x, (5.0 / 3.0));
@@ -216,8 +216,8 @@ void    OverlandFlowEvalKin(
             Sf_mag = ov_epsilon;
 
           Press_x = RPMean(-Sf_x, 0.0,
-                           pfmax((pp[ipm1]), 0.0),
-                           pfmax((pp[ip]), 0.0));
+                           PondedDepth(pp[ipm1]),
+                           PondedDepth(pp[ip]));
 
           qx_v[io - 1] = -(Sf_x / (RPowerR(fabs(Sf_mag), 0.5) * mann_dat[io - 1]))
                          * RPowerR(Press_x, (5.0 / 3.0));
@@ -239,8 +239,8 @@ void    OverlandFlowEvalKin(
             Sf_mag = ov_epsilon;
 
           Press_y = RPMean(-Sf_y, 0.0,
-                           pfmax((pp[ipmsy]), 0.0),
-                           pfmax((pp[ip]), 0.0));
+                           PondedDepth(pp[ipmsy]),
+                           PondedDepth(pp[ip]));
 
           qy_v[io - sy_v] = -(Sf_y / (RPowerR(fabs(Sf_mag), 0.5)
                                       * mann_dat[io - sy_v])) * RPowerR(Press_y, (5.0 / 3.0));
@@ -262,7 +262,7 @@ void    OverlandFlowEvalKin(
           if (Sf_x > 0.0)
           {
             ip = SubvectorEltIndex(p_sub, i, j, k1);
-            Press_x = pfmax((pp[ip]), 0.0);
+            Press_x = PondedDepth(pp[ip]);
             qx_v[io - 1] = -(Sf_x / (RPowerR(fabs(Sf_mag), 0.5) * mann_dat[io])) * RPowerR(Press_x, (5.0 / 3.0));
           }
         }
@@ -283,7 +283,7 @@ void    OverlandFlowEvalKin(
           if (Sf_y > 0.0)
           {
             ip = SubvectorEltIndex(p_sub, i, j, k1);
-            Press_y = pfmax((pp[ip]), 0.0);
+            Press_y = PondedDepth(pp[ip]);
             qy_v[io - sy_v] = -(Sf_y / (RPowerR(fabs(Sf_mag), 0.5) * mann_dat[io])) * RPowerR(Press_y, (5.0 / 3.0));
           }
         }
@@ -372,14 +372,19 @@ void    OverlandFlowEvalKin(
           PP_ippsy = pp[ippsy];
 
         Press_x = RPMean(-Sf_x, 0.0,
-                         pfmax((pp[ip]), 0.0),
-                         pfmax((PP_ipp1), 0.0));
+                         PondedDepth(pp[ip]),
+                         (k1x >= 0) ? PondedDepth(PP_ipp1) : 0.0);
         Press_y = RPMean(-Sf_y, 0.0,
-                         pfmax((pp[ip]), 0.0),
-                         pfmax((PP_ippsy), 0.0));
+                         PondedDepth(pp[ip]),
+                         (k1y >= 0) ? PondedDepth(PP_ippsy) : 0.0);
 
         qx_temp = -(5.0 / 3.0) * (Sf_x / (RPowerR(fabs(Sf_mag), 0.5) * mann_dat[io])) * RPowerR(Press_x, (2.0 / 3.0));
         qy_temp = -(5.0 / 3.0) * (Sf_y / (RPowerR(fabs(Sf_mag), 0.5) * mann_dat[io])) * RPowerR(Press_y, (2.0 / 3.0));
+        if (ponding_smoothing_width > 0.0)
+        {
+          qx_temp *= PondedDepthSlope(RPMean(-Sf_x, 0.0, pp[ip], PP_ipp1));
+          qy_temp *= PondedDepthSlope(RPMean(-Sf_y, 0.0, pp[ip], PP_ippsy));
+        }
         //ke_v[io] = qx_temp;
         //kn_v[io] = qy_temp;
         //kw_v[io+1] = qx_temp;
@@ -414,10 +419,12 @@ void    OverlandFlowEvalKin(
             Sf_mag = ov_epsilon;
 
           Press_x = RPMean(-Sf_x, 0.0,
-                           pfmax((pp[ipm1]), 0.0),
-                           pfmax((pp[ip]), 0.0));
+                           PondedDepth(pp[ipm1]),
+                           PondedDepth(pp[ip]));
 
           qx_temp = -(5.0 / 3.0) * (Sf_x / (RPowerR(fabs(Sf_mag), 0.5) * mann_dat[io - 1])) * RPowerR(Press_x, (2.0 / 3.0));
+          if (ponding_smoothing_width > 0.0)
+            qx_temp *= PondedDepthSlope(RPMean(-Sf_x, 0.0, pp[ipm1], pp[ip]));
           kw_v[io] = -pfmax(-qx_temp, 0);
           ke_v[io - 1] = pfmax(qx_temp, 0);
         }
@@ -438,10 +445,12 @@ void    OverlandFlowEvalKin(
             Sf_mag = ov_epsilon;
 
           Press_y = RPMean(-Sf_y, 0.0,
-                           pfmax((pp[ipmsy]), 0.0),
-                           pfmax((pp[ip]), 0.0));
+                           PondedDepth(pp[ipmsy]),
+                           PondedDepth(pp[ip]));
 
           qy_temp = -(5.0 / 3.0) * (Sf_y / (RPowerR(fabs(Sf_mag), 0.5) * mann_dat[io - sy_v])) * RPowerR(Press_y, (2.0 / 3.0));
+          if (ponding_smoothing_width > 0.0)
+            qy_temp *= PondedDepthSlope(RPMean(-Sf_y, 0.0, pp[ipmsy], pp[ip]));
           ks_v[io] = -pfmax(-qy_temp, 0);
           kn_v[io - sy_v] = pfmax(qy_temp, 0);
         }
@@ -462,8 +471,10 @@ void    OverlandFlowEvalKin(
           if (Sf_x > 0.0)
           {
             ip = SubvectorEltIndex(p_sub, i, j, k1);
-            Press_x = pfmax((pp[ip]), 0.0);
+            Press_x = PondedDepth(pp[ip]);
             qx_temp = -(5.0 / 3.0) * (Sf_x / (RPowerR(fabs(Sf_mag), 0.5) * mann_dat[io])) * RPowerR(Press_x, (2.0 / 3.0));
+            if (ponding_smoothing_width > 0.0)
+              qx_temp *= PondedDepthSlope(pp[ip]);
             //qx_v[io - 1] = qx_temp;
 
             //kw_v[io] = qx_temp;
@@ -489,8 +500,10 @@ void    OverlandFlowEvalKin(
           if (Sf_y > 0.0)
           {
             ip = SubvectorEltIndex(p_sub, i, j, k1);
-            Press_y = pfmax((pp[ip]), 0.0);
+            Press_y = PondedDepth(pp[ip]);
             qy_temp = -(5.0 / 3.0) * (Sf_y / (RPowerR(fabs(Sf_mag), 0.5) * mann_dat[io])) * RPowerR(Press_y, (2.0 / 3.0));
+            if (ponding_smoothing_width > 0.0)
+              qy_temp *= PondedDepthSlope(pp[ip]);
             //qy_v[io - sy_v] = qy_temp;
             //ks_v[io] = qy_temp;
             ks_v[io] = -pfmax(-qy_temp, 0);

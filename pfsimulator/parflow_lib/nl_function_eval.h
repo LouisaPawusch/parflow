@@ -86,3 +86,23 @@ typedef struct {
 #define StateXvel(state)          ((state)->x_velocity) //jjb
 #define StateYvel(state)          ((state)->y_velocity) //jjb
 #define StateZvel(state)          ((state)->z_velocity) //jjb
+
+/* Ponding smoothing (oracle experiment, 2026-10-30). In the OverlandKinematic terms the ponded depth is
+ * max(p, 0), whose kink at p = 0 is where Newton stalls. With a width w > 0 it is replaced by the smooth
+ * 0.5 (p + sqrt(p^2 + w^2)), which is w/2 at p = 0 and tends to max(p, 0) away from 0.
+ * KinsolNonlinSolver sets w for the first of its two solves (Solver.Nonlinear.PondingSmoothing.Width) and
+ * back to 0 for the second, so the answer is the exact problem's. w = 0 (the default) is the exact
+ * max(p, 0); callers keep their original code for that case, so runs without smoothing are unchanged.
+ * Macros, not functions: they are expanded after math.h is included (parflow.h). */
+extern double ponding_smoothing_width;
+
+#define PondedDepth(pressure)                                                                       \
+        (ponding_smoothing_width > 0.0                                                             \
+         ? 0.5 * ((pressure) + sqrt((pressure) * (pressure) + ponding_smoothing_width * ponding_smoothing_width)) \
+         : pfmax((pressure), 0.0))
+
+/* d PondedDepth / dp */
+#define PondedDepthSlope(pressure)                                                                  \
+        (ponding_smoothing_width > 0.0                                                             \
+         ? 0.5 * (1.0 + (pressure) / sqrt((pressure) * (pressure) + ponding_smoothing_width * ponding_smoothing_width)) \
+         : ((pressure) > 0.0 ? 1.0 : 0.0))

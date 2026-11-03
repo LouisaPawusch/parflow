@@ -329,6 +329,8 @@ void *KINMalloc(integer Neq, FILE *msgfp, void *machEnv)
   lsolve = NULL;
   lfree = NULL;
   lmem = NULL;
+  kin_mem->kin_step_limiter = NULL;
+  kin_mem->kin_unlimited_step = NULL;
   kin_mem->kin_Neq = Neq;
   kin_mem->kin_msgfp = fp;
   uround = UnitRoundoff();
@@ -694,6 +696,8 @@ int KINSol(void *kinmem, integer Neq,
            boole optIn, long int iopt[], real ropt[], void *f_data)
 {
   real fnormp = 0.0, f1normp = 0.0, epsmin = 0.0;
+  real unlimited_sfdotJp = 0.0, unlimited_sJpnorm = 0.0;
+  int nr_limited = 0;
   int ret, globalstratret = 0;
   boole maxStepTaken = 0, noMinEps;
   N_Vector bb, xx;
@@ -811,6 +815,31 @@ int KINSol(void *kinmem, integer Neq,
       break;
 
 
+    /* Optional per-cell step limiter: keep the Krylov step for the fallback, let the limiter change the
+     * step, and recompute the slope terms of the changed step, which the line search needs. A limited
+     * step that is not a descent direction is not searched along: the unlimited step is used. */
+    nr_limited = 0;
+    if (kin_mem->kin_step_limiter != NULL)
+    {
+      N_VScale(ONE, pp, kin_mem->kin_unlimited_step);
+      unlimited_sfdotJp = sfdotJp;
+      unlimited_sJpnorm = sJpnorm;
+      nr_limited = kin_mem->kin_step_limiter(uu, pp, f_data);
+      if (nr_limited > 0)
+        KINSpgmrStepSlope(kin_mem, pp, unew);
+      if (printfl > 0)
+        fprintf(msgfp, "KINSol step limiter: %d cells limited\n", nr_limited);
+      if (nr_limited > 0 && sfdotJp >= ZERO)
+      {
+        N_VScale(ONE, kin_mem->kin_unlimited_step, pp);
+        sfdotJp = unlimited_sfdotJp;
+        sJpnorm = unlimited_sJpnorm;
+        nr_limited = 0;
+        if (printfl > 0)
+          fprintf(msgfp, "KINSol step limiter: limited step is no descent direction, unlimited step used\n");
+      }
+    }
+
     /* call the appropriate routine to calculate an acceptable step pp  */
 
     if (globalstrategy == INEXACT_NEWTON)
@@ -819,6 +848,19 @@ int KINSol(void *kinmem, integer Neq,
     else if (globalstrategy == LINESEARCH)
       globalstratret =
         KINLineSearch((struct KINMemRec *)kinmem, &fnormp, &f1normp, &maxStepTaken);
+
+    /* Fallback: if the line search found no acceptable point along the limited step, it has left uu and
+     * fval unchanged; search again along the unlimited Krylov step */
+    if (nr_limited > 0 && globalstrategy == LINESEARCH && globalstratret == 1)
+    {
+      N_VScale(ONE, kin_mem->kin_unlimited_step, pp);
+      sfdotJp = unlimited_sfdotJp;
+      sJpnorm = unlimited_sJpnorm;
+      if (printfl > 0)
+        fprintf(msgfp, "KINSol step limiter: line search failed on the limited step, unlimited step used\n");
+      globalstratret =
+        KINLineSearch((struct KINMemRec *)kinmem, &fnormp, &f1normp, &maxStepTaken);
+    }
 
     /* if too many beta condition failures, stop iteration  */
 
@@ -919,6 +961,8 @@ void KINFree(void *kinsol_mem)
     return;
 
   KINFreeVectors(kin_mem);
+  if (kin_mem->kin_unlimited_step != NULL)
+    N_VFree(kin_mem->kin_unlimited_step);
 
   if (kin_mem != NULL)
     lfree(kin_mem);

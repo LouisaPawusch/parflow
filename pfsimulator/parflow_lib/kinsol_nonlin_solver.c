@@ -29,6 +29,14 @@
 #include "parflow.h"
 #include "kinsol_dependences.h"
 
+/* Ponding smoothing width in m read by the residual and the Jacobian (nl_function_eval.h). It is 0 except
+ * during the smoothed first solve of KinsolNonlinSolver. */
+double ponding_smoothing_width = 0.0;
+
+/* Where the ponding step limiter stops a top cell whose Newton update crosses p = 0, in m
+ * (Solver.Nonlinear.PondingStepLimiter.Offset) */
+static double ponding_step_limiter_offset = 1.0e-5;
+
 /*--------------------------------------------------------------------------
  * Structures
  *--------------------------------------------------------------------------*/
@@ -49,6 +57,10 @@ typedef struct {
   double eta_alpha;
   double eta_gamma;
   double derivative_epsilon;
+
+  double ponding_smoothing_width;          /* m; 0 = no smoothed first solve */
+  double ponding_smoothing_switch_tol;     /* residual tolerance of the smoothed first solve */
+  int ponding_step_limiter;                /* 1 = limit top-cell updates that cross p = 0 */
 
   PFModule *precond;
   PFModule *nl_function_eval;
@@ -166,6 +178,71 @@ int   KINSolCallPC(
   return(0);
 }
 
+/*--------------------------------------------------------------------------
+ * PondingStepLimiter: per-cell limiter of the Newton step (Appleyard-type chopping), called by KINSol after
+ * the linear solve. A top cell whose update would carry it across p = 0 is stopped just past 0, at
+ * +offset (wetting) or -offset (drying), so the next iteration evaluates the Jacobian on the cell's new side
+ * of the ponding switch. The converged equations are unchanged; only the path is. Applied to the top cell
+ * of every active column (in CONUS2.1 all of them lie on OverlandKinematic patches). Returns the number of
+ * limited cells summed over all processes.
+ *--------------------------------------------------------------------------*/
+
+static int PondingStepLimiter(N_Vector current_pressure, N_Vector step, void *current_state)
+{
+  ProblemData *problem_data = StateProblemData((State*)current_state);
+  Vector      *top = ProblemDataIndexOfDomainTop(problem_data);
+  Grid        *grid = VectorGrid(current_pressure);
+  int nr_limited_cells = 0;
+  int is;
+
+  ForSubgridI(is, GridSubgrids(grid))
+  {
+    Subgrid   *subgrid = GridSubgrid(grid, is);
+    Subvector *pressure_sub = VectorSubvector(current_pressure, is);
+    Subvector *step_sub = VectorSubvector(step, is);
+    Subvector *top_sub = VectorSubvector(top, is);
+    double    *pressure_data = SubvectorData(pressure_sub);
+    double    *step_data = SubvectorData(step_sub);
+    double    *top_data = SubvectorData(top_sub);
+    int first_x = SubgridIX(subgrid);
+    int first_y = SubgridIY(subgrid);
+    int nr_x = SubgridNX(subgrid);
+    int nr_y = SubgridNY(subgrid);
+    int i, j;
+
+    for (j = first_y; j < first_y + nr_y; j++)
+    {
+      for (i = first_x; i < first_x + nr_x; i++)
+      {
+        int top_layer = (int)top_data[SubvectorEltIndex(top_sub, i, j, 0)];
+        if (top_layer < 0)
+          continue;    /* inactive column */
+
+        int index = SubvectorEltIndex(pressure_sub, i, j, top_layer);
+        double pressure_now = pressure_data[index];
+        double pressure_after_step = pressure_now + step_data[index];
+
+        if (pressure_now < 0.0 && pressure_after_step > 0.0)
+        {
+          step_data[index] = ponding_step_limiter_offset - pressure_now;
+          nr_limited_cells++;
+        }
+        else if (pressure_now > 0.0 && pressure_after_step < 0.0)
+        {
+          step_data[index] = -ponding_step_limiter_offset - pressure_now;
+          nr_limited_cells++;
+        }
+      }
+    }
+  }
+
+  amps_Invoice result_invoice = amps_NewInvoice("%i", &nr_limited_cells);
+  amps_AllReduce(amps_CommWorld, result_invoice, amps_Add);
+  amps_FreeInvoice(result_invoice);
+
+  return nr_limited_cells;
+}
+
 void PrintFinalStats(
                      FILE *    out_file,
                      long int *integer_outputs_now,
@@ -250,10 +327,40 @@ int KinsolNonlinSolver(Vector *pressure, Vector *density, Vector *old_density, V
   StateYvel(current_state) = y_velocity;           //jjb
   StateZvel(current_state) = z_velocity;           //jjb
 
+  BeginTiming(public_xtra->time_index);
+
+  /* Continuation with a smoothed ponded depth: first solve the smoothed problem to a loose tolerance, then
+   * the exact problem from its answer (below). Both solves count; the answer is the exact problem's. If the
+   * smoothed solve does not converge, the exact solve starts from wherever it stopped. */
+  if (public_xtra->ponding_smoothing_width > 0.0)
+  {
+    /* the attempt header stays as ParFlow writes it (log parsers read the time as its last word) */
+    if (!amps_Rank(amps_CommWorld))
+      fprintf(kinsol_file, "\nKINSOL smoothed ponding solve: width %g m, switch tolerance %g"
+              "\nKINSOL starting step for time %f\n",
+              public_xtra->ponding_smoothing_width, public_xtra->ponding_smoothing_switch_tol, t);
+
+    ponding_smoothing_width = public_xtra->ponding_smoothing_width;
+    ret = KINSol((void*)kin_mem, neq, pressure, feval, globalization, uscale, fscale,
+                 public_xtra->ponding_smoothing_switch_tol, step_tol,
+                 NULL, TRUE, iopt, ropt, current_state);
+    ponding_smoothing_width = 0.0;
+
+    integer_outputs[NNI] += iopt[NNI];
+    integer_outputs[NFE] += iopt[NFE];
+    integer_outputs[NBCF] += iopt[NBCF];
+    integer_outputs[NBKTRK] += iopt[NBKTRK];
+    integer_outputs[SPGMR_NLI] += iopt[SPGMR_NLI];
+    integer_outputs[SPGMR_NPE] += iopt[SPGMR_NPE];
+    integer_outputs[SPGMR_NPS] += iopt[SPGMR_NPS];
+    integer_outputs[SPGMR_NCFL] += iopt[SPGMR_NCFL];
+
+    if (!amps_Rank(amps_CommWorld))
+      PrintFinalStats(kinsol_file, iopt, integer_outputs);
+  }
+
   if (!amps_Rank(amps_CommWorld))
     fprintf(kinsol_file, "\nKINSOL starting step for time %f\n", t);
-
-  BeginTiming(public_xtra->time_index);
 
   ret = KINSol((void*)kin_mem,          /* Memory allocated above */
                neq,                     /* Dummy variable here */
@@ -405,6 +512,11 @@ PFModule  *KinsolNonlinSolverInitInstanceXtra(
 
     /* Initialize KINSol memory */
     kin_mem = (KINMem)KINMalloc(neq, kinsol_file, NULL);
+    if (public_xtra->ponding_step_limiter)
+    {
+      kin_mem->kin_step_limiter = PondingStepLimiter;
+      kin_mem->kin_unlimited_step = N_VNew(neq, NULL);
+    }
 
     /* Initialize the gmres linear solver in KINSol */
     KINSpgmr((void*)kin_mem,           /* Memory allocated above */
@@ -615,6 +727,21 @@ PFModule  *KinsolNonlinSolverNewPublicXtra()
 
   sprintf(key, "Solver.Nonlinear.DerivativeEpsilon");
   (public_xtra->derivative_epsilon) = GetDoubleDefault(key, 1e-7);
+
+  /* Oracle experiments (2026-10-30): continuation with a smoothed ponded depth, and the ponding step
+   * limiter. Off by default; then the solver is unchanged. */
+  sprintf(key, "Solver.Nonlinear.PondingSmoothing.Width");
+  (public_xtra->ponding_smoothing_width) = GetDoubleDefault(key, 0.0);
+  sprintf(key, "Solver.Nonlinear.PondingSmoothing.SwitchTolerance");
+  (public_xtra->ponding_smoothing_switch_tol) = GetDoubleDefault(key, 0.1);
+
+  switch_na = NA_NewNameArray("False True");
+  sprintf(key, "Solver.Nonlinear.PondingStepLimiter");
+  switch_name = GetStringDefault(key, "False");
+  (public_xtra->ponding_step_limiter) = NA_NameToIndexExitOnError(switch_na, switch_name, key);
+  NA_FreeNameArray(switch_na);
+  sprintf(key, "Solver.Nonlinear.PondingStepLimiter.Offset");
+  ponding_step_limiter_offset = GetDoubleDefault(key, 1.0e-5);
 
   globalization_switch_na = NA_NewNameArray("InexactNewton LineSearch");
   sprintf(key, "Solver.Nonlinear.Globalization");

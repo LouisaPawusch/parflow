@@ -1905,8 +1905,11 @@ void NlFunctionEval(Vector *     pressure, /* Current pressure values */
         // RMM, switch seepage face on optionally for two surface patches
         if ((int)patch_dat[io] == public_xtra->seepage_patch_one || (int)patch_dat[io] == public_xtra->seepage_patch_two)
         {
-          q_overlnd = vol
-                      * (pfmax(pp[ip], 0.0) - 0.0) / dz; //+
+          if (ponding_smoothing_width > 0.0)
+            q_overlnd = vol * (PondedDepth(pp[ip]) - 0.0) / dz;
+          else
+            q_overlnd = vol
+                        * (pfmax(pp[ip], 0.0) - 0.0) / dz; //+
           //* dt* (pfmax(pp[ip], 0.0) -0.0) / dz + //RMM, why is dt multiplied by the first term?
           // dt * vol * ((ke_[io] - kw_[io]) / dx + (kn_[io] - ks_[io]) / dy)
           // / dz;
@@ -1914,10 +1917,16 @@ void NlFunctionEval(Vector *     pressure, /* Current pressure values */
         }
         else
         {
-          q_overlnd = vol
-                      * (pfmax(pp[ip], 0.0) - pfmax(opp[ip], 0.0)) / dz +
-                      dt * vol * ((ke_[io] - kw_[io]) / dx + (kn_[io] - ks_[io]) / dy)
-                      / dz;
+          if (ponding_smoothing_width > 0.0)
+            q_overlnd = vol
+                        * (PondedDepth(pp[ip]) - PondedDepth(opp[ip])) / dz +
+                        dt * vol * ((ke_[io] - kw_[io]) / dx + (kn_[io] - ks_[io]) / dy)
+                        / dz;
+          else
+            q_overlnd = vol
+                        * (pfmax(pp[ip], 0.0) - pfmax(opp[ip], 0.0)) / dz +
+                        dt * vol * ((ke_[io] - kw_[io]) / dx + (kn_[io] - ks_[io]) / dy)
+                        / dz;
         }
 
         fp[ip] += q_overlnd;

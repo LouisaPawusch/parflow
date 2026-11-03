@@ -1623,7 +1623,18 @@ void    RichardsJacobianEval(
           itwo = public_xtra->seepage_patch_two;
 
           /* Now add overland contributions to JC */
-          if ((pp[ip]) > 0.0)
+          if (ponding_smoothing_width > 0.0)
+          {
+            /* Smoothed ponded depth (nl_function_eval.h): its slope replaces the on/off switch below; the
+             * flux derivatives ke_der ... already carry the slope (OverlandFlowEvalKin, CALCDER) */
+            if (iitmp == ione || iitmp == itwo)
+              cp_c[io] += (vol / dz) * PondedDepthSlope(pp[ip]);
+            else
+              cp_c[io] += (vol / dz) * PondedDepthSlope(pp[ip])
+                          + (vol / ffy) * dt * (ke_der[io1] - kw_der[io1])
+                          + (vol / ffx) * dt * (kn_der[io1] - ks_der[io1]);
+          }
+          else if ((pp[ip]) > 0.0)
           {
             /* RMM, switch seepage face on optionally for two surface patches */
             if (iitmp == ione || iitmp == itwo)
@@ -1968,7 +1979,17 @@ void    RichardsJacobianEval(
           itwo = public_xtra->seepage_patch_two;
 
           /* Now add overland contributions to J similar to JC above */
-          if ((pp[ip]) > 0.0)
+          if (ponding_smoothing_width > 0.0)
+          {
+            /* Smoothed ponded depth, as in the JC block above (the seepage term keeps this block's dt) */
+            if (iitmp == ione || iitmp == itwo)
+              cp[im] += dt * (vol / dz) * PondedDepthSlope(pp[ip]);
+            else
+              cp[im] += (vol / dz) * PondedDepthSlope(pp[ip])
+                        + (vol / ffy) * dt * (ke_der[io1] - kw_der[io1])
+                        + (vol / ffx) * dt * (kn_der[io1] - ks_der[io1]);
+          }
+          else if ((pp[ip]) > 0.0)
           {
             /* RMM, switch seepage face on optionally for two surface patches */
             if (iitmp == ione || iitmp == itwo)
