@@ -224,6 +224,7 @@ typedef struct {
 
   int nc_evap_trans_file_transient;     /* read NetCDF evap_trans as a transient file before advance richards timestep */
   char *nc_evap_trans_filename; /* NetCDF File name for evap trans */
+  char *initial_guess_filename; /* PFB that replaces the Newton initial guess of the first time step ("" = off) */
 } PublicXtra;
 
 typedef struct {
@@ -1914,6 +1915,7 @@ AdvanceRichards(PFModule * this_module, double start_time,      /* Starting time
   char nc_postfix[2048];
 
   int first_tstep = 1;
+  int initial_guess_not_yet_applied = 1;   /* the guess file belongs to the first step only */
 
   sprintf(file_prefix, "%s", GlobalsOutFileName);
 
@@ -3158,6 +3160,27 @@ AdvanceRichards(PFModule * this_module, double start_time,      /* Starting time
             }
           }
                        );
+        }
+      }
+
+      /* Oracle / harness: replace the Newton initial guess with a pressure field read from a PFB.
+       * Placed after the surface predictor, so the file has the last word.
+       * old_pressure (the previous step's state) is untouched: only the starting point of the
+       * solve changes, never the problem being solved.
+       * Applied on the first attempt of the first time step only; if that solve fails and dt
+       * is cut, the retry starts from the usual guess, which the KINSOL log will show. */
+      if (public_xtra->initial_guess_filename[0] != '\0' && initial_guess_not_yet_applied)
+      {
+        ReadPFBinary(public_xtra->initial_guess_filename, instance_xtra->pressure);
+
+        /* ReadPFBinary fills each rank's own cells; exchange so the ghost layers match */
+        handle = InitVectorUpdate(instance_xtra->pressure, VectorUpdateAll);
+        FinalizeVectorUpdate(handle);
+
+        initial_guess_not_yet_applied = 0;
+        if (!amps_Rank(amps_CommWorld))
+        {
+          amps_Printf("Solver.InitialGuessFile: initial guess read from %s\n", public_xtra->initial_guess_filename);
         }
       }
 
@@ -6405,6 +6428,9 @@ SolverRichardsNewPublicXtra(char *name)
   {
     WriteSiloPMPIOInit(GlobalsOutFileName);
   }
+
+  sprintf(key, "%s.InitialGuessFile", name);
+  public_xtra->initial_guess_filename = GetStringDefault(key, "");
 
   NA_FreeNameArray(switch_na);
   PFModulePublicXtra(this_module) = public_xtra;
