@@ -517,6 +517,13 @@ enum { ETACHOICE1 = 0, ETACHOICE2, ETACONSTANT }; /* 3 methods to determine eta
  * of entries it changed, summed over all processes, so that every process takes the same branch. */
 typedef int (*KINStepLimiterFn)(N_Vector uu, N_Vector pp, void *f_data);
 
+/* Optional per-cell limiter of the trial iterate. Called by the global strategy (line search or
+ * inexact Newton) every time it forms a trial iterate unew = uu + rl * pp, before the function
+ * evaluation; it may change unew in place and returns the number of entries it changed, summed over
+ * all processes. The step pp is not changed, so backtracking scales the Newton step and the limiter
+ * is applied to the result. */
+typedef int (*KINTrialLimiterFn)(N_Vector uu, N_Vector unew, void *f_data);
+
 typedef struct KINMemRec {
   real kin_uround;   /* machine unit roundoff */
 
@@ -645,6 +652,17 @@ typedef struct KINMemRec {
 
   KINStepLimiterFn kin_step_limiter;
   N_Vector kin_unlimited_step;
+
+  /* Per-cell trial limiter (NULL = none). The three vectors are work space the caller allocates with
+   * the limiter: F(uu) saved before the global strategy, a copy of the step, and scratch. */
+
+  KINTrialLimiterFn kin_trial_limiter;
+  int kin_trial_limiter_on;        /* 0 while the fallback searches without the limiter */
+  int kin_nr_trial_limited;        /* entries changed at the last trial iterate formed */
+  int kin_any_trial_limited;       /* 1 if any trial iterate of this global strategy call was changed */
+  N_Vector kin_lim_fval;
+  N_Vector kin_lim_step;
+  N_Vector kin_lim_work;
 } *KINMem;
 
 

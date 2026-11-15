@@ -45,6 +45,12 @@ static double ponding_step_limiter_offset = 1.0e-5;
 #define PONDING_STEP_LIMITER_DRYING  2
 static int ponding_step_limiter_direction = PONDING_STEP_LIMITER_BOTH;
 
+/* Where the limiter is applied (Solver.Nonlinear.PondingStepLimiter.Type): InLineSearch (default), to
+ * every trial iterate of the global strategy, or PreLineSearch, once to the Newton step before the
+ * global strategy. The values are the indices of the names in the key's name array. */
+#define PONDING_STEP_LIMITER_IN_LINE_SEARCH  0
+#define PONDING_STEP_LIMITER_PRE_LINE_SEARCH 1
+
 /*--------------------------------------------------------------------------
  * Structures
  *--------------------------------------------------------------------------*/
@@ -69,6 +75,7 @@ typedef struct {
   double ponding_smoothing_width;          /* m; 0 = no smoothed first solve */
   double ponding_smoothing_switch_tol;     /* residual tolerance of the smoothed first solve */
   int ponding_step_limiter;                /* 1 = limit top-cell updates that cross p = 0 */
+  int ponding_step_limiter_type;           /* PONDING_STEP_LIMITER_IN_LINE_SEARCH or _PRE_LINE_SEARCH */
 
   PFModule *precond;
   PFModule *nl_function_eval;
@@ -187,15 +194,20 @@ int   KINSolCallPC(
 }
 
 /*--------------------------------------------------------------------------
- * PondingStepLimiter: per-cell limiter of the Newton step (Appleyard-type chopping), called by KINSol after
- * the linear solve. A top cell whose update would carry it across p = 0 is stopped just past 0, at
- * +offset (wetting) or -offset (drying), so the next iteration evaluates the Jacobian on the cell's new side
- * of the ponding switch. The converged equations are unchanged; only the path is. Applied to the top cell
- * of every active column (in CONUS2.1 all of them lie on OverlandKinematic patches). Returns the number of
- * limited cells summed over all processes.
+ * Ponding limiter (Appleyard-type chopping) for the embedded KINSol. A top cell whose Newton update
+ * would carry it across p = 0 is stopped just past 0, at +offset (wetting) or -offset (drying), so the
+ * next iteration evaluates the Jacobian on the cell's new side of the ponding switch. The converged
+ * equations are unchanged; only the path is. Applied to the top cell of every active column.
+ *
+ * PondingLimitCells does the work for both forms of the limiter:
+ *   update_is_trial = 0: 'update' is the Newton step; the step entry of a crossing cell is replaced
+ *                        (PondingStepLimiter, called once after the linear solve);
+ *   update_is_trial = 1: 'update' is the trial iterate uu + rl * pp; the entry of a crossing cell is
+ *                        replaced (PondingTrialLimiter, called for every trial iterate of the line search).
+ * Returns the number of limited cells summed over all processes.
  *--------------------------------------------------------------------------*/
 
-static int PondingStepLimiter(N_Vector current_pressure, N_Vector step, void *current_state)
+static int PondingLimitCells(N_Vector current_pressure, N_Vector update, void *current_state, int update_is_trial)
 {
   ProblemData *problem_data = StateProblemData((State*)current_state);
   Vector      *top = ProblemDataIndexOfDomainTop(problem_data);
@@ -207,10 +219,10 @@ static int PondingStepLimiter(N_Vector current_pressure, N_Vector step, void *cu
   {
     Subgrid   *subgrid = GridSubgrid(grid, is);
     Subvector *pressure_sub = VectorSubvector(current_pressure, is);
-    Subvector *step_sub = VectorSubvector(step, is);
+    Subvector *update_sub = VectorSubvector(update, is);
     Subvector *top_sub = VectorSubvector(top, is);
     double    *pressure_data = SubvectorData(pressure_sub);
-    double    *step_data = SubvectorData(step_sub);
+    double    *update_data = SubvectorData(update_sub);
     double    *top_data = SubvectorData(top_sub);
     int first_x = SubgridIX(subgrid);
     int first_y = SubgridIY(subgrid);
@@ -228,21 +240,27 @@ static int PondingStepLimiter(N_Vector current_pressure, N_Vector step, void *cu
 
         int index = SubvectorEltIndex(pressure_sub, i, j, top_layer);
         double pressure_now = pressure_data[index];
-        double pressure_after_step = pressure_now + step_data[index];
+        double pressure_after = update_is_trial ? update_data[index] : pressure_now + update_data[index];
+        double pressure_limited;
 
-        /* A crossing in the direction not limited is left to Newton (the unlimited step) */
-        if (pressure_now < 0.0 && pressure_after_step > 0.0
+        /* A crossing in the direction not limited is left to Newton */
+        if (pressure_now < 0.0 && pressure_after > 0.0
             && ponding_step_limiter_direction != PONDING_STEP_LIMITER_DRYING)
-        {
-          step_data[index] = ponding_step_limiter_offset - pressure_now;
-          nr_limited_cells++;
-        }
-        else if (pressure_now > 0.0 && pressure_after_step < 0.0
+          pressure_limited = ponding_step_limiter_offset;
+        else if (pressure_now > 0.0 && pressure_after < 0.0
                  && ponding_step_limiter_direction != PONDING_STEP_LIMITER_WETTING)
-        {
-          step_data[index] = -ponding_step_limiter_offset - pressure_now;
-          nr_limited_cells++;
-        }
+          pressure_limited = -ponding_step_limiter_offset;
+        else
+          continue;
+
+        /* Trial form only: a cell that ends between 0 and the offset has crossed by less than the
+         * offset; moving it out to the offset would lengthen its update, so it is left where it is.
+         * (The step form keeps the original behavior and always places the cell at the offset.) */
+        if (update_is_trial && fabs(pressure_after) <= ponding_step_limiter_offset)
+          continue;
+
+        update_data[index] = update_is_trial ? pressure_limited : pressure_limited - pressure_now;
+        nr_limited_cells++;
       }
     }
   }
@@ -252,6 +270,16 @@ static int PondingStepLimiter(N_Vector current_pressure, N_Vector step, void *cu
   amps_FreeInvoice(result_invoice);
 
   return nr_limited_cells;
+}
+
+static int PondingStepLimiter(N_Vector current_pressure, N_Vector step, void *current_state)
+{
+  return PondingLimitCells(current_pressure, step, current_state, 0);
+}
+
+static int PondingTrialLimiter(N_Vector current_pressure, N_Vector trial_pressure, void *current_state)
+{
+  return PondingLimitCells(current_pressure, trial_pressure, current_state, 1);
 }
 
 void PrintFinalStats(
@@ -523,10 +551,18 @@ PFModule  *KinsolNonlinSolverInitInstanceXtra(
 
     /* Initialize KINSol memory */
     kin_mem = (KINMem)KINMalloc(neq, kinsol_file, NULL);
-    if (public_xtra->ponding_step_limiter)
+    if (public_xtra->ponding_step_limiter
+        && public_xtra->ponding_step_limiter_type == PONDING_STEP_LIMITER_PRE_LINE_SEARCH)
     {
       kin_mem->kin_step_limiter = PondingStepLimiter;
       kin_mem->kin_unlimited_step = N_VNew(neq, NULL);
+    }
+    else if (public_xtra->ponding_step_limiter)
+    {
+      kin_mem->kin_trial_limiter = PondingTrialLimiter;
+      kin_mem->kin_lim_fval = N_VNew(neq, NULL);
+      kin_mem->kin_lim_step = N_VNew(neq, NULL);
+      kin_mem->kin_lim_work = N_VNew(neq, NULL);
     }
 
     /* Initialize the gmres linear solver in KINSol */
@@ -746,6 +782,7 @@ PFModule  *KinsolNonlinSolverNewPublicXtra()
   sprintf(key, "Solver.Nonlinear.PondingSmoothing.SwitchTolerance");
   (public_xtra->ponding_smoothing_switch_tol) = GetDoubleDefault(key, 0.1);
 
+  /* Ponding step limiter (embedded KINSOL only). Off by default; then the solver is unchanged. */
   switch_na = NA_NewNameArray("False True");
   sprintf(key, "Solver.Nonlinear.PondingStepLimiter");
   switch_name = GetStringDefault(key, "False");
@@ -757,6 +794,11 @@ PFModule  *KinsolNonlinSolverNewPublicXtra()
   sprintf(key, "Solver.Nonlinear.PondingStepLimiter.Direction");
   switch_name = GetStringDefault(key, "Both");
   ponding_step_limiter_direction = NA_NameToIndexExitOnError(switch_na, switch_name, key);
+  NA_FreeNameArray(switch_na);
+  switch_na = NA_NewNameArray("InLineSearch PreLineSearch");
+  sprintf(key, "Solver.Nonlinear.PondingStepLimiter.Type");
+  switch_name = GetStringDefault(key, "InLineSearch");
+  (public_xtra->ponding_step_limiter_type) = NA_NameToIndexExitOnError(switch_na, switch_name, key);
   NA_FreeNameArray(switch_na);
 
   globalization_switch_na = NA_NewNameArray("InexactNewton LineSearch");
