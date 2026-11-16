@@ -29,6 +29,10 @@
 #include "parflow.h"
 #include "kinsol_dependences.h"
 
+/* Where the ponding step limiter stops a top cell whose Newton update crosses p = 0, in m
+ * (Solver.Nonlinear.PondingStepLimiter.Offset) */
+static double ponding_step_limiter_offset = 1.0e-5;
+
 /*--------------------------------------------------------------------------
  * Structures
  *--------------------------------------------------------------------------*/
@@ -49,6 +53,8 @@ typedef struct {
   double eta_alpha;
   double eta_gamma;
   double derivative_epsilon;
+
+  int ponding_step_limiter;                /* 1 = limit top-cell updates that cross p = 0 */
 
   PFModule *precond;
   PFModule *nl_function_eval;
@@ -164,6 +170,71 @@ int   KINSolCallPC(
   PFModuleInvokeType(KinsolPCInvoke, precond, (vtem));
 
   return(0);
+}
+
+/*--------------------------------------------------------------------------
+ * PondingStepLimiter: per-cell limiter of the Newton step (Appleyard-type chopping), called by KINSol after
+ * the linear solve. A top cell whose update would carry it across p = 0 is stopped just past 0, at
+ * +offset (wetting) or -offset (drying), so the next iteration evaluates the Jacobian on the cell's new side
+ * of the ponding switch. The converged equations are unchanged; only the path is. Applied to the top cell
+ * of every active column (in CONUS2.1 all of them lie on OverlandKinematic patches). Returns the number of
+ * limited cells summed over all processes.
+ *--------------------------------------------------------------------------*/
+
+static int PondingStepLimiter(N_Vector current_pressure, N_Vector step, void *current_state)
+{
+  ProblemData *problem_data = StateProblemData((State*)current_state);
+  Vector      *top = ProblemDataIndexOfDomainTop(problem_data);
+  Grid        *grid = VectorGrid(current_pressure);
+  int nr_limited_cells = 0;
+  int is;
+
+  ForSubgridI(is, GridSubgrids(grid))
+  {
+    Subgrid   *subgrid = GridSubgrid(grid, is);
+    Subvector *pressure_sub = VectorSubvector(current_pressure, is);
+    Subvector *step_sub = VectorSubvector(step, is);
+    Subvector *top_sub = VectorSubvector(top, is);
+    double    *pressure_data = SubvectorData(pressure_sub);
+    double    *step_data = SubvectorData(step_sub);
+    double    *top_data = SubvectorData(top_sub);
+    int first_x = SubgridIX(subgrid);
+    int first_y = SubgridIY(subgrid);
+    int nr_x = SubgridNX(subgrid);
+    int nr_y = SubgridNY(subgrid);
+    int i, j;
+
+    for (j = first_y; j < first_y + nr_y; j++)
+    {
+      for (i = first_x; i < first_x + nr_x; i++)
+      {
+        int top_layer = (int)top_data[SubvectorEltIndex(top_sub, i, j, 0)];
+        if (top_layer < 0)
+          continue;    /* inactive column */
+
+        int index = SubvectorEltIndex(pressure_sub, i, j, top_layer);
+        double pressure_now = pressure_data[index];
+        double pressure_after_step = pressure_now + step_data[index];
+
+        if (pressure_now < 0.0 && pressure_after_step > 0.0)
+        {
+          step_data[index] = ponding_step_limiter_offset - pressure_now;
+          nr_limited_cells++;
+        }
+        else if (pressure_now > 0.0 && pressure_after_step < 0.0)
+        {
+          step_data[index] = -ponding_step_limiter_offset - pressure_now;
+          nr_limited_cells++;
+        }
+      }
+    }
+  }
+
+  amps_Invoice result_invoice = amps_NewInvoice("%i", &nr_limited_cells);
+  amps_AllReduce(amps_CommWorld, result_invoice, amps_Add);
+  amps_FreeInvoice(result_invoice);
+
+  return nr_limited_cells;
 }
 
 void PrintFinalStats(
@@ -405,6 +476,11 @@ PFModule  *KinsolNonlinSolverInitInstanceXtra(
 
     /* Initialize KINSol memory */
     kin_mem = (KINMem)KINMalloc(neq, kinsol_file, NULL);
+    if (public_xtra->ponding_step_limiter)
+    {
+      kin_mem->kin_step_limiter = PondingStepLimiter;
+      kin_mem->kin_unlimited_step = N_VNew(neq, NULL);
+    }
 
     /* Initialize the gmres linear solver in KINSol */
     KINSpgmr((void*)kin_mem,           /* Memory allocated above */
@@ -615,6 +691,16 @@ PFModule  *KinsolNonlinSolverNewPublicXtra()
 
   sprintf(key, "Solver.Nonlinear.DerivativeEpsilon");
   (public_xtra->derivative_epsilon) = GetDoubleDefault(key, 1e-7);
+
+  /* Ponding step limiter (Newton step limiter at p = 0 on the top cells). Off by default; then the solver
+   * is unchanged. */
+  switch_na = NA_NewNameArray("False True");
+  sprintf(key, "Solver.Nonlinear.PondingStepLimiter");
+  switch_name = GetStringDefault(key, "False");
+  (public_xtra->ponding_step_limiter) = NA_NameToIndexExitOnError(switch_na, switch_name, key);
+  NA_FreeNameArray(switch_na);
+  sprintf(key, "Solver.Nonlinear.PondingStepLimiter.Offset");
+  ponding_step_limiter_offset = GetDoubleDefault(key, 1.0e-5);
 
   globalization_switch_na = NA_NewNameArray("InexactNewton LineSearch");
   sprintf(key, "Solver.Nonlinear.Globalization");
